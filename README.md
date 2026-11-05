@@ -115,11 +115,11 @@ ccguard-cli -- --help  # 把 --help 交给 Claude CLI，仍先检查和确认
 ccguard-desktop
 ```
 
-CLI 通过 PATH 寻找 `claude`。Desktop 验证应用包标识，默认查找 `/Applications/Claude.app`、`~/Applications/Claude.app` 和 Spotlight 登记的应用；自定义位置可设置：
+CLI 通过 PATH 寻找 `claude`。**Desktop 固定启动 `/Applications/Claude.app`**，确认前会在终端显示这个路径。输入 `y` 后，每次重新核验应用包标识 `com.anthropic.claudefordesktop`、主程序 `Contents/MacOS/Claude`、桌面应用类型，以及 Anthropic 的 Developer ID 签名（Team ID `Q6L2SF6YDW`）；签名校验包含嵌套代码。
 
-```sh
-export CLAUDE_DESKTOP_APP="/其他位置/Claude.app"
-```
+固定路径、元数据或主程序不能通过符号链接指向其他位置。路径不存在、身份不匹配、签名核验失败或超时都会停止启动，不会转而搜索同名应用、URL Handler、Chrome 网页应用、用户应用目录或安装镜像。旧的 `CLAUDE_DESKTOP_APP` 环境变量不再生效。其他 Mac 也需将官方 Desktop 安装到 `/Applications/Claude.app`。
+
+签名约束使用 macOS 的代码签名要求机制，见 [Apple 签名要求说明](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。此校验不固定版本号，同一开发者签名的正常更新仍可使用。
 
 这两个命令的参数传给 Claude，不传给网络检查。要调整检查选项，请单独使用 `ccguard-check`。
 

@@ -23,7 +23,15 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 NET_CHECK = Path(__file__).resolve().with_name("net_check.py")
+DESKTOP_APP = Path("/Applications/Claude.app")
 DESKTOP_ID = "com.anthropic.claudefordesktop"
+DESKTOP_TEAM_ID = "Q6L2SF6YDW"
+DESKTOP_REQUIREMENT = (
+    f'=identifier "{DESKTOP_ID}" and anchor apple generic '
+    'and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
+    'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
+    f'and certificate leaf[subject.OU] = "{DESKTOP_TEAM_ID}"'
+)
 GRACE_SECONDS = 5.0
 KILL_WAIT_SECONDS = 8.0
 QUIET_SECONDS = 3.0
@@ -63,22 +71,46 @@ def desktop_bundle(path: Path) -> bool:
 
 
 def find_desktop() -> Optional[Path]:
-    override = os.environ.get("CLAUDE_DESKTOP_APP")
-    if override:
-        candidate = Path(override).expanduser().resolve()
-        return candidate if desktop_bundle(candidate) else None
-    for path in (Path("/Applications/Claude.app"), Path.home() / "Applications/Claude.app"):
-        if desktop_bundle(path):
-            return path
-    result = subprocess.run(
-        ["/usr/bin/mdfind", f"kMDItemCFBundleIdentifier == '{DESKTOP_ID}'"],
-        capture_output=True, text=True, timeout=5, check=False,
-    )
-    for line in result.stdout.splitlines():
-        path = Path(line)
-        if desktop_bundle(path):
-            return path
-    return None
+    """只允许已安装的固定路径；每次启动前重新读身份并核验 Anthropic 签名。"""
+    app = DESKTOP_APP
+    if app.is_symlink():
+        raise RuntimeError(f"桌面启动路径不能是符号链接: {app}")
+    if not app.exists():
+        return None
+    info = app / "Contents/Info.plist"
+    executable = app / "Contents/MacOS/Claude"
+    if not app.is_dir():
+        raise RuntimeError(f"桌面启动路径不是应用目录: {app}")
+    if not info.is_file() or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError(f"桌面应用缺少有效的元数据或主程序: {app}")
+    for path in (app, info, executable):
+        if path.resolve(strict=True) != path:
+            raise RuntimeError(f"桌面应用路径被重定向，已取消启动: {path}")
+    try:
+        with info.open("rb") as handle:
+            metadata = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        raise RuntimeError(f"无法读取桌面应用身份，已取消启动: {app}") from exc
+    if (not isinstance(metadata, dict) or metadata.get("CFBundleIdentifier") != DESKTOP_ID
+            or metadata.get("CFBundleExecutable") != "Claude"
+            or metadata.get("CFBundlePackageType") != "APPL"
+            or metadata.get("LSBackgroundOnly") or metadata.get("LSUIElement")):
+        raise RuntimeError(f"固定路径中的应用不是预期的 Claude Desktop，已取消启动: {app}")
+    # Bundle ID 可以被仿写；同时验证完整签名、开发者身份和签名标识。
+    # 不缓存启动校验，避免正常更新或路径内容变化后复用旧结果。
+    try:
+        result = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--deep", "--strict",
+             "--test-requirement", DESKTOP_REQUIREMENT, str(app)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Claude Desktop 签名核验超时，已取消启动。") from exc
+    except OSError as exc:
+        raise RuntimeError("无法执行 Claude Desktop 签名核验，已取消启动。") from exc
+    if result.returncode:
+        raise RuntimeError("Claude Desktop 签名或开发者身份核验失败，已取消启动。")
+    return app
 
 
 def check_network(arguments: List[str]) -> int:
@@ -100,6 +132,8 @@ def launch(kind: str, arguments: List[str]) -> int:
         print("网络检查被中断或未正常完成，已取消启动。", file=sys.stderr)
         return 1
     label = "Claude CLI" if kind == "cli" else "Claude Desktop"
+    if kind == "desktop":
+        print(f"桌面启动目标（固定）: {DESKTOP_APP}", flush=True)
     # PASS / FAIL / WARN 均由用户看完结果后决定，不隐式放行或替用户拒绝。
     if not confirm_launch(label):
         print("已取消启动。", flush=True)
@@ -113,7 +147,7 @@ def launch(kind: str, arguments: List[str]) -> int:
         return 0
     app = find_desktop()
     if app is None:
-        print("未找到 Claude.app；安装桌面版后重试。自定义位置可设置 CLAUDE_DESKTOP_APP。",
+        print(f"未找到固定路径的 Claude Desktop: {DESKTOP_APP}；请安装到此位置后重试。",
               file=sys.stderr)
         return 127
     command = ["/usr/bin/open", "-a", str(app)]

@@ -134,7 +134,7 @@ class LaunchTests(OfflineCase):
              patch("builtins.input", return_value="y"), patch.object(commands, "find_desktop", return_value=None):
             self.assertEqual(commands.launch("desktop", []), 127)
         run.assert_called_once()
-        self.assertIn("未找到 Claude.app", self.stderr.getvalue())
+        self.assertIn("未找到固定路径的 Claude Desktop: /Applications/Claude.app", self.stderr.getvalue())
 
     def test_missing_cli_reports_failure_without_exec(self):
         with patch.object(commands.subprocess, "run", return_value=Mock(returncode=0)), \
@@ -184,22 +184,156 @@ class DiscoveryTests(OfflineCase):
             helper = root / "Claude.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper"
             self.assertEqual(commands.claude_app_for_executable(str(helper)), root / "Claude.app")
 
-    def test_custom_desktop_location_is_validated_without_searching(self):
-        with patch.dict(os.environ, {"CLAUDE_DESKTOP_APP": "/Custom/Claude.app"}), \
-             patch.object(commands, "desktop_bundle", return_value=True):
-            self.assertEqual(commands.find_desktop(), Path("/Custom/Claude.app"))
+    def test_default_desktop_path_is_fixed(self):
+        self.assertEqual(commands.DESKTOP_APP, Path("/Applications/Claude.app"))
 
-    def test_invalid_override_does_not_fall_back_to_another_app(self):
-        with patch.dict(os.environ, {"CLAUDE_DESKTOP_APP": "/Custom/Wrong.app"}), \
-             patch.object(commands, "desktop_bundle", return_value=False):
+
+class DesktopIdentityTests(OfflineCase):
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory(prefix="ccguard-desktop-identity-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.app = self.root / "Claude.app"
+        self.info = self.app / "Contents/Info.plist"
+        self.executable = self.app / "Contents/MacOS/Claude"
+        self.executable.parent.mkdir(parents=True)
+        self.executable.write_text("fixture only; must never be executed\n")
+        self.executable.chmod(0o755)
+        self.write_metadata()
+        patcher = patch.object(commands, "DESKTOP_APP", self.app)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_metadata(self, **changes):
+        metadata = {"CFBundleIdentifier": commands.DESKTOP_ID, "CFBundleExecutable": "Claude",
+                    "CFBundlePackageType": "APPL"}
+        metadata.update(changes)
+        self.info.write_bytes(plistlib.dumps(metadata))
+
+    def test_valid_locked_bundle_requires_verified_vendor_signature(self):
+        with patch.object(commands.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            self.assertEqual(commands.find_desktop(), self.app)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:5], ["/usr/bin/codesign", "--verify", "--deep", "--strict", "--test-requirement"])
+        self.assertEqual(argv[-1], str(self.app))
+        self.assertIn('identifier "com.anthropic.claudefordesktop"', argv[-2])
+        self.assertIn('anchor apple generic', argv[-2])
+        self.assertIn('certificate leaf[subject.OU] = "Q6L2SF6YDW"', argv[-2])
+        self.assertIn('certificate leaf[field.1.2.840.113635.100.6.1.13] exists', argv[-2])
+
+    def test_old_override_cannot_redirect_to_handler_chrome_or_other_copy(self):
+        for override in ("/Custom/Claude.app", "/Users/test/Applications/Claude Code URL Handler.app",
+                         "/Users/test/Applications/Chrome Apps.localized/Claude.app", "/Volumes/Claude/Claude.app"):
+            with self.subTest(override=override), patch.dict(os.environ, {"CLAUDE_DESKTOP_APP": override}), \
+                 patch.object(commands.subprocess, "run", return_value=Mock(returncode=0)) as run:
+                self.assertEqual(commands.find_desktop(), self.app)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][-1], str(self.app))
+
+    def test_missing_locked_path_does_not_search_or_use_override(self):
+        with patch.object(commands, "DESKTOP_APP", self.root/"missing.app"), \
+             patch.dict(os.environ, {"CLAUDE_DESKTOP_APP": str(self.app)}):
             self.assertIsNone(commands.find_desktop())
 
-    def test_spotlight_result_is_checked_before_use(self):
-        found = Path("/Applications/AI/Claude.app")
-        with patch.dict(os.environ, {}, clear=True), \
-             patch.object(commands, "desktop_bundle", side_effect=lambda path: path == found), \
-             patch.object(commands.subprocess, "run", return_value=Mock(stdout=str(found) + "\n", returncode=0)):
-            self.assertEqual(commands.find_desktop(), found)
+    def test_root_symlink_cannot_redirect_to_another_copy(self):
+        alias = self.root / "alias.app"
+        alias.symlink_to(self.app, target_is_directory=True)
+        with patch.object(commands, "DESKTOP_APP", alias), self.assertRaisesRegex(RuntimeError, "符号链接"):
+            commands.find_desktop()
+
+    def test_executable_symlink_cannot_redirect_to_cli(self):
+        cli = self.root / "claude-cli"
+        self.executable.rename(cli)
+        self.executable.symlink_to(cli)
+        with self.assertRaisesRegex(RuntimeError, "重定向"):
+            commands.find_desktop()
+
+    def test_metadata_symlink_is_rejected(self):
+        metadata = self.root / "other.plist"
+        self.info.rename(metadata)
+        self.info.symlink_to(metadata)
+        with self.assertRaisesRegex(RuntimeError, "重定向"):
+            commands.find_desktop()
+
+    def test_url_handler_chrome_and_helpers_are_rejected_before_signature_check(self):
+        for identifier in ("com.anthropic.claude-code-url-handler",
+                           "com.google.Chrome.app.fmpnliohjhemenmnlpbfagaolkdacoja",
+                           "com.anthropic.claudefordesktop.helper"):
+            with self.subTest(identifier=identifier):
+                self.write_metadata(CFBundleIdentifier=identifier)
+                with self.assertRaisesRegex(RuntimeError, "不是预期的 Claude Desktop"):
+                    commands.find_desktop()
+
+    def test_wrong_program_or_background_bundle_is_rejected_even_with_matching_id(self):
+        for changes in ({"CFBundleExecutable": "claude"}, {"CFBundleExecutable": "app_mode_loader"},
+                        {"CFBundlePackageType": "BNDL"}, {"LSBackgroundOnly": True}, {"LSUIElement": True}):
+            with self.subTest(changes=changes):
+                self.write_metadata(**changes)
+                with self.assertRaisesRegex(RuntimeError, "不是预期的 Claude Desktop"):
+                    commands.find_desktop()
+
+    def test_missing_or_nonexecutable_main_program_is_rejected(self):
+        self.executable.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "缺少有效"):
+            commands.find_desktop()
+        self.executable.unlink()
+        with self.assertRaisesRegex(RuntimeError, "缺少有效"):
+            commands.find_desktop()
+
+    def test_malformed_metadata_is_rejected(self):
+        for data in (b'not a plist', plistlib.dumps([commands.DESKTOP_ID])):
+            with self.subTest(data=data):
+                self.info.write_bytes(data)
+                with self.assertRaises(RuntimeError):
+                    commands.find_desktop()
+
+    def test_matching_metadata_does_not_override_invalid_signature(self):
+        with patch.object(commands.subprocess, "run", return_value=Mock(returncode=1)), \
+             self.assertRaisesRegex(RuntimeError, "签名或开发者身份核验失败"):
+            commands.find_desktop()
+
+    def test_signature_timeout_and_missing_verifier_stop_launch(self):
+        for error in (subprocess.TimeoutExpired("codesign", 20), FileNotFoundError("codesign")):
+            with self.subTest(error=error), patch.object(commands.subprocess, "run", side_effect=error), \
+                 self.assertRaisesRegex(RuntimeError, "已取消启动"):
+                commands.find_desktop()
+
+    def test_launch_identity_is_not_reused_from_process_discovery_cache(self):
+        self.assertTrue(commands.desktop_bundle(self.app))
+        self.write_metadata(CFBundleIdentifier="com.anthropic.claude-code-url-handler")
+        with self.assertRaisesRegex(RuntimeError, "不是预期的 Claude Desktop"):
+            commands.find_desktop()
+
+    def test_signature_is_verified_on_every_launch_attempt(self):
+        with patch.object(commands.subprocess, "run", side_effect=[Mock(returncode=0), Mock(returncode=1)]) as run:
+            self.assertEqual(commands.find_desktop(), self.app)
+            with self.assertRaisesRegex(RuntimeError, "签名或开发者身份核验失败"):
+                commands.find_desktop()
+        self.assertEqual(run.call_count, 2)
+
+    def test_target_is_visible_before_confirmation_and_verification_precedes_open(self):
+        events = []
+        def external(argv, **kwargs):
+            events.append(Path(argv[0]).name if argv[0] != commands.sys.executable else "net_check")
+            return Mock(returncode=0)
+        def confirm(prompt):
+            self.assertIn(str(self.app), self.stdout.getvalue())
+            events.append("confirm")
+            return "y"
+        with patch.object(commands.subprocess, "run", side_effect=external) as run, \
+             patch("builtins.input", side_effect=confirm):
+            self.assertEqual(commands.launch("desktop", ["argument with spaces"]), 0)
+        self.assertEqual(events, ["net_check", "confirm", "codesign", "open"])
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/open", "-a", str(self.app), "--args", "argument with spaces"])
+
+    def test_failed_identity_never_reaches_open(self):
+        with patch.object(commands.subprocess, "run", side_effect=[Mock(returncode=0), Mock(returncode=1)]) as run, \
+             patch("builtins.input", return_value="y"):
+            self.assertEqual(commands.main(["desktop"]), 1)
+        self.assertEqual([Path(item.args[0][0]).name for item in run.call_args_list],
+                         [Path(commands.sys.executable).name, "codesign"])
+        self.assertIn("已取消启动", self.stderr.getvalue())
 
 
 class ProcessTests(OfflineCase):
