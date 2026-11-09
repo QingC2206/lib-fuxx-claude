@@ -429,93 +429,60 @@ class ProcessTests(OfflineCase):
 
 
 class BackgroundTests(OfflineCase):
-    RECORD = """ #12:
-                 Name: Claude - background tasks
-                 Type: background tasks (0x2000)
-          Disposition: [enabled, disallowed, notified] (0x9)
-           Identifier: 8192.com.anthropic.claudefordesktop
-                  URL: (null)
-    Parent Identifier: 2.com.anthropic.claudefordesktop
-"""
-    HEADER = " Records for UID 501 : 00000000-0000-0000-0000-000000000000\n"
-
     def setUp(self):
         super().setUp()
         patcher = patch.object(commands, "responsibility_function", return_value=Mock())
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_actual_macos_format_enabled_disallowed_is_permission_denied(self):
-        self.assertEqual(commands.parse_background_permission(self.HEADER + self.RECORD, UID), "disallowed")
-
-    def test_allowed_permission_is_recognized(self):
-        self.assertEqual(commands.parse_background_permission(
-            self.HEADER + self.RECORD.replace("disallowed", "allowed"), UID), "allowed")
-
-    def test_records_are_scoped_to_current_user(self):
-        output = (self.HEADER.replace("501", "0") + self.RECORD.replace("disallowed", "allowed")
-                  + self.HEADER + self.RECORD
-                  + self.HEADER.replace("501", "502") + self.RECORD.replace("disallowed", "allowed"))
-        self.assertEqual(commands.parse_background_permission(output, UID), "disallowed")
-
-    def test_app_record_is_not_mistaken_for_background_task_permission(self):
-        app = " #11:\n Type: app (0x2)\n Disposition: [enabled, allowed]\n Identifier: 2." + commands.DESKTOP_ID + "\n"
-        self.assertEqual(commands.parse_background_permission(self.HEADER + app + self.RECORD, UID), "disallowed")
-        self.assertEqual(commands.parse_background_permission(self.HEADER + app, UID), "not_registered")
-
-    def test_unknown_or_conflicting_permission_is_not_assumed_clean(self):
-        for output in ("unrecognized output", self.HEADER + self.RECORD.replace("disallowed", "unknown"),
-                       self.HEADER + self.RECORD.replace("disallowed", "allowed, disallowed"),
-                       self.HEADER + self.RECORD + self.RECORD.replace("#12", "#13").replace("disallowed", "allowed")):
-            with self.subTest(output=output), self.assertRaises(ValueError):
-                commands.parse_background_permission(output, UID)
-
     def test_inactive_registered_service_is_not_a_running_pid(self):
         output = "PID\tStatus\tLabel\n-\t0\t" + commands.DESKTOP_ID + "\n"
-        with patch.object(commands.subprocess, "run", side_effect=[
-                Mock(stdout=self.HEADER + self.RECORD), Mock(stdout=output)]) as run:
+        with patch.object(commands.subprocess, "run", return_value=Mock(stdout=output)) as run:
             state = commands.read_background_state()
-        self.assertEqual(state.permission, "disallowed")
         self.assertEqual(state.jobs, {})
         self.assertEqual(state.registered_jobs, [commands.DESKTOP_ID])
         self.assertEqual(state.errors, [])
-        self.assertEqual([item.args[0] for item in run.call_args_list], [
-            ["/usr/bin/sfltool", "dumpbtm"], ["/bin/launchctl", "list"]])
+        run.assert_called_once_with(["/bin/launchctl", "list"], capture_output=True, text=True,
+                                    check=True, timeout=5, stdin=subprocess.DEVNULL)
 
     def test_active_service_is_reported_without_trusting_lookalike_labels(self):
         label = "application." + commands.DESKTOP_ID + ".123.456"
         output = ("PID Status Label\n77 0 " + label + "\n"
                   "78 0 " + commands.DESKTOP_ID + "unrelated\n"
                   "79 0 example.com.anthropic.claudefordesktop\n")
-        with patch.object(commands.subprocess, "run", side_effect=[
-                Mock(stdout=self.HEADER + self.RECORD), Mock(stdout=output)]):
+        with patch.object(commands.subprocess, "run", return_value=Mock(stdout=output)):
             state = commands.read_background_state()
         self.assertEqual(state.jobs, {77: [label]})
         self.assertEqual(state.errors, [])
 
-    def test_timeout_and_invalid_btm_format_preserve_uncertainty(self):
-        for result in (subprocess.TimeoutExpired("sfltool", 5), Mock(stdout="unknown format")):
-            with self.subTest(result=result), patch.object(commands.subprocess, "run", side_effect=[
-                    result, Mock(stdout="PID Status Label\n")]):
-                state = commands.read_background_state()
-            self.assertEqual(state.permission, "unknown")
-            self.assertEqual(len(state.errors), 1)
-            self.assertIn("后台权限未核验", state.errors[0])
-
-    def test_service_read_failure_does_not_overwrite_known_permission(self):
-        for result in (subprocess.CalledProcessError(1, "launchctl"), Mock(stdout="unknown format"),
+    def test_service_read_failures_remain_warnings_without_authorization_fallback(self):
+        for result in (PermissionError("denied"), subprocess.TimeoutExpired("launchctl", 5),
+                       subprocess.CalledProcessError(1, "launchctl"), Mock(stdout="unknown format"),
                        Mock(stdout="PID Status Label\nbad line\n"),
                        Mock(stdout="PID Status Label\n0 0 " + commands.DESKTOP_ID + "\n")):
-            with self.subTest(result=result), patch.object(commands.subprocess, "run", side_effect=[
-                    Mock(stdout=self.HEADER + self.RECORD), result]):
+            with self.subTest(result=result), \
+                 patch.object(commands.subprocess, "run", side_effect=[result]) as run:
                 state = commands.read_background_state()
-            self.assertEqual(state.permission, "disallowed")
             self.assertEqual(len(state.errors), 1)
             self.assertIn("后台服务未核验", state.errors[0])
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], ["/bin/launchctl", "list"])
+
+    def test_permission_is_never_inferred_from_service_presence(self):
+        for output in ("PID Status Label\n", "PID Status Label\n- 0 " + commands.DESKTOP_ID + "\n",
+                       "PID Status Label\n77 0 " + commands.DESKTOP_ID + "\n"):
+            with self.subTest(output=output), \
+                 patch.object(commands.subprocess, "run", return_value=Mock(stdout=output)), \
+                 patch("builtins.input", side_effect=AssertionError("must not ask for input")):
+                state = commands.read_background_state()
+                with contextlib.redirect_stdout(io.StringIO()) as output_text:
+                    commands.report_background(state)
+                self.assertIn("后台权限: 未读取（免密码模式）", output_text.getvalue())
+                self.assertNotIn("已关闭", output_text.getvalue())
+                self.assertNotIn("开启状态", output_text.getvalue())
 
     def test_unavailable_responsibility_interface_is_reported(self):
-        with patch.object(commands.subprocess, "run", side_effect=[
-                Mock(stdout=self.HEADER + self.RECORD), Mock(stdout="PID Status Label\n")]), \
+        with patch.object(commands.subprocess, "run", return_value=Mock(stdout="PID Status Label\n")), \
              patch.object(commands, "responsibility_function", return_value=None):
             state = commands.read_background_state()
         self.assertEqual(len(state.errors), 1)
@@ -530,8 +497,8 @@ class QuitTests(OfflineCase):
             patcher = patch.object(commands, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = patch.object(commands, "read_background_state",
-                               side_effect=lambda: commands.BackgroundState(permission="disallowed"))
+        self.read_background_state = commands.read_background_state
+        patcher = patch.object(commands, "read_background_state", side_effect=commands.BackgroundState)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -540,7 +507,7 @@ class QuitTests(OfflineCase):
              patch.object(commands.time, "monotonic", side_effect=[0, 0, 3]), \
              patch.object(commands.time, "sleep"):
             self.assertEqual(commands.kill_claude(), 0)
-        self.assertIn("[OK] 后台任务权限: 已关闭", self.stdout.getvalue())
+        self.assertIn("后台权限: 未读取（免密码模式）", self.stdout.getvalue())
 
     def test_dry_run_has_no_quit_or_signal_side_effects(self):
         with patch.object(commands, "snapshot_processes", return_value={10: process(10)}):
@@ -671,25 +638,61 @@ class QuitTests(OfflineCase):
              patch.object(commands, "read_background_state", return_value=commands.BackgroundState(errors=["unreadable"])):
             self.assertEqual(commands.kill_claude(), 2)
         self.assertNotIn("连续 3 秒未检出", self.stdout.getvalue())
-        self.assertIn("[WARN] 后台任务权限: 未确认", self.stdout.getvalue())
+        self.assertIn("后台权限: 未读取（免密码模式）", self.stdout.getvalue())
 
     def test_active_background_service_without_verified_process_is_not_ignored(self):
-        state = commands.BackgroundState(permission="allowed", jobs={77: [commands.DESKTOP_ID + ".helper"]})
+        state = commands.BackgroundState(jobs={77: [commands.DESKTOP_ID + ".helper"]})
         with patch.object(commands, "snapshot_processes", return_value={}), \
              patch.object(commands, "wait_for_exit", return_value={}), \
              patch.object(commands, "read_background_state", return_value=state):
             self.assertEqual(commands.kill_claude(), 2)
         self.assertIn("PID 77", self.stderr.getvalue())
 
-    def test_allowed_permission_alone_is_not_claimed_to_be_a_running_process(self):
-        state = commands.BackgroundState(permission="allowed", registered_jobs=[commands.DESKTOP_ID])
+    def test_skipped_permission_check_does_not_mark_process_cleanup_as_failure(self):
+        state = commands.BackgroundState(registered_jobs=[commands.DESKTOP_ID])
         with patch.object(commands, "snapshot_processes", return_value={}), \
              patch.object(commands, "wait_for_exit", return_value={}), \
              patch.object(commands, "read_background_state", return_value=state), \
              patch("builtins.input", side_effect=AssertionError("background warning must not prompt")):
             self.assertEqual(commands.kill_claude(), 0)
-        self.assertIn("⚠️⚠️⚠️ Claude 的后台权限处于开启状态", self.stdout.getvalue())
+        self.assertIn("后台权限: 未读取（免密码模式）", self.stdout.getvalue())
         self.assertIn("系统设置 → 通用 → 登录项与扩展 → App 后台活动", self.stdout.getvalue())
+
+    def test_normal_and_dry_run_paths_only_use_unprivileged_quit_and_service_commands(self):
+        desktop = process(10, executable=str(APP / "Contents/MacOS/Claude"))
+        for target in (None, process(11), desktop):
+            for dry_run in (False, True):
+                calls = []
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    if argv == ["/bin/launchctl", "list"]:
+                        return Mock(stdout="PID Status Label\n")
+                    if argv == ["/usr/bin/osascript", "-e", commands.QUIT_SCRIPT, str(APP)]:
+                        return Mock(returncode=0)
+                    raise AssertionError(f"unexpected external command: {argv}")
+                snapshots = [{target.pid: target} if target else {}]
+                if not dry_run:
+                    snapshots.append({})
+                with self.subTest(target=target, dry_run=dry_run), \
+                     patch.object(commands, "snapshot_processes", side_effect=snapshots), \
+                     patch.object(commands, "claude_app_for_executable",
+                                  side_effect=lambda path: APP if path == desktop.executable else None), \
+                     patch.object(commands, "wait_for_exit", return_value={}), \
+                     patch.object(commands, "signal_if_current") as send, \
+                     patch.object(commands, "responsibility_function", return_value=Mock()), \
+                     patch.object(commands, "read_background_state", side_effect=self.read_background_state), \
+                     patch.object(commands.subprocess, "run", side_effect=run), \
+                     patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                    args = ["kill", "--dry-run"] if dry_run else ["kill"]
+                    self.assertEqual(commands.main(args), 0)
+                expected = [["/bin/launchctl", "list"]]
+                if target == desktop and not dry_run:
+                    expected.insert(0, ["/usr/bin/osascript", "-e", commands.QUIT_SCRIPT, str(APP)])
+                self.assertEqual(calls, expected)
+                if dry_run or target in (None, desktop):
+                    send.assert_not_called()
+                else:
+                    send.assert_called_once_with(target, signal.SIGTERM)
 
     def test_other_user_claude_process_is_reported_without_killing(self):
         with patch.object(commands, "snapshot_processes", return_value={10: process(10, uid=0)}), \

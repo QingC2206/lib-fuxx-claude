@@ -315,43 +315,9 @@ def request_desktop_quit(app: Path) -> None:
 
 @dataclass
 class BackgroundState:
-    permission: str = "unknown"
     jobs: Dict[int, List[str]] = field(default_factory=dict)
     registered_jobs: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
-
-
-def parse_background_permission(text: str, uid: int) -> str:
-    """BTM disposition 是权限状态，不是当前是否有进程；尤其不能把 enabled 当 running。"""
-    headers = list(re.finditer(
-        r"(?im)^[ \t]*Records for UID[ \t]+(-?\d+)[ \t]*(?::[^\r\n]*)?$", text))
-    if not headers:
-        raise ValueError("无法识别 BTM 数据格式")
-    permissions = set()
-    for index, header in enumerate(headers):
-        if int(header.group(1)) != uid:
-            continue
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
-        for block in re.split(r"(?m)(?=^\s*#\d+:)", text[header.end():end]):
-            values = {key.strip(): value.strip() for key, value in re.findall(
-                r"(?m)^[ \t]*([A-Za-z ]+):[ \t]*(.*?)\r?$", block)}
-            identifier = values.get("Identifier", "")
-            parent = values.get("Parent Identifier", "")
-            if not (identifier == "8192." + DESKTOP_ID or
-                    (parent == "2." + DESKTOP_ID and values.get("Type", "").startswith("background tasks"))):
-                continue
-            words = set(re.findall(r"[a-z]+", values.get("Disposition", "").lower()))
-            if {"allowed", "disallowed"} <= words:
-                raise ValueError("Claude 后台任务权限字段相互冲突")
-            if "disallowed" in words:
-                permissions.add("disallowed")
-            elif "allowed" in words:
-                permissions.add("allowed")
-            else:
-                raise ValueError("Claude 后台任务缺少明确的允许/禁止状态")
-    if len(permissions) > 1:
-        raise ValueError("Claude 后台任务权限记录相互冲突")
-    return next(iter(permissions)) if permissions else "not_registered"
 
 
 def is_claude_service(label: str) -> bool:
@@ -361,16 +327,12 @@ def is_claude_service(label: str) -> bool:
 
 
 def read_background_state() -> BackgroundState:
+    # dumpbtm 即便只读也会请求 system.privilege.admin，可能弹出密码窗口。
+    # 不查询 BTM、不提权、不使用缓存冒充当前权限；只读取当前用户的服务状态。
     state = BackgroundState()
     try:
-        result = subprocess.run(["/usr/bin/sfltool", "dumpbtm"], capture_output=True, text=True,
-                                check=True, timeout=5)
-        state.permission = parse_background_permission(result.stdout, os.getuid())
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        state.errors.append(f"后台权限未核验: {type(exc).__name__}")
-    try:
         result = subprocess.run(["/bin/launchctl", "list"], capture_output=True, text=True,
-                                check=True, timeout=5)
+                                check=True, timeout=5, stdin=subprocess.DEVNULL)
         lines = result.stdout.splitlines()
         if not lines or lines[0].split() != ["PID", "Status", "Label"]:
             raise ValueError("无法识别 launchd 服务列表")
@@ -394,11 +356,8 @@ def read_background_state() -> BackgroundState:
 
 
 def report_background(state: BackgroundState) -> None:
-    labels = {"disallowed": "[OK] 后台任务权限: 已关闭",
-              "allowed": "⚠️⚠️⚠️ Claude 的后台权限处于开启状态，建议从「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中关闭 Claude。",
-              "not_registered": "[INFO] 后台任务权限: 未登记持续后台任务",
-              "unknown": "[WARN] 后台任务权限: 未确认"}
-    print(labels[state.permission], flush=True)
+    print("[INFO] 后台权限: 未读取（免密码模式）；可在「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中查看或关闭 Claude。",
+          flush=True)
     for pid, labels_for_pid in sorted(state.jobs.items()):
         print(f"后台服务仍报告 PID {pid}: {', '.join(labels_for_pid)}", file=sys.stderr)
     for error in state.errors:
@@ -504,7 +463,7 @@ def main(arguments: Optional[List[str]] = None) -> int:
         return 2
     kind, forwarded = arguments[0], arguments[1:]
     if kind != "check" and forwarded in (["-h"], ["--help"]):
-        print("ccguard-kill [--dry-run]：正常退出、清理残留，连续观察后核验后台状态；不更改权限。"
+        print("ccguard-kill [--dry-run]：正常退出、清理残留，连续观察后核验后台服务；不读取或更改后台权限，无需管理员密码。"
               "返回码 0=范围内未检出，1=有残留/失败，2=后台或归属未确认。" if kind == "kill" else
               f"ccguard-{kind} [参数…]：先运行 net_check.py，再询问 [y/N]；参数原样传给 Claude。")
         return 0
