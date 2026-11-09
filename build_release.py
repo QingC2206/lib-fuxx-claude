@@ -10,9 +10,9 @@ import zipfile
 from pathlib import Path
 
 
-FILES = ("README.md", "LICENSE", "VERSION", "install.sh", "uninstall.sh", "install.py",
+FILES = ("README.md", "LICENSE", "VERSION", "install.sh", "uninstall.sh", "install.py", "background-access.sh",
          "ccguard.py", "net_check.py", "build_release.py", "tests/test_ccguard.py",
-         "tests/test_net_check.py", "tests/test_installer.py")
+         "tests/test_net_check.py", "tests/test_installer.py", "tests/test_background_access.py")
 
 
 def build(source: Path, output: Path) -> Path:

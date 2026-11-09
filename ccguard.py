@@ -315,9 +315,47 @@ def request_desktop_quit(app: Path) -> None:
 
 @dataclass
 class BackgroundState:
+    permission: str = "not_configured"
     jobs: Dict[int, List[str]] = field(default_factory=dict)
     registered_jobs: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+
+
+def background_rule_path() -> Path:
+    return Path(f"/private/etc/sudoers.d/ccguard-btm-{os.getuid()}")
+
+
+def parse_background_permission(text: str, uid: int) -> str:
+    """仅解析当前用户的持续后台任务权限，不能把 enabled 当成 allowed。"""
+    headers = list(re.finditer(
+        r"(?im)^[ \t]*Records for UID[ \t]+(-?\d+)[ \t]*(?::[^\r\n]*)?$", text))
+    if not headers:
+        raise ValueError("无法识别 BTM 数据格式")
+    permissions = set()
+    matched_user = False
+    for index, header in enumerate(headers):
+        if int(header.group(1)) != uid:
+            continue
+        matched_user = True
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        for block in re.split(r"(?m)(?=^\s*#\d+:)", text[header.end():end]):
+            values = {key.strip(): value.strip() for key, value in re.findall(
+                r"(?m)^[ \t]*([A-Za-z ]+):[ \t]*(.*?)\r?$", block)}
+            identifier = values.get("Identifier", "")
+            parent = values.get("Parent Identifier", "")
+            if not (identifier == "8192." + DESKTOP_ID or
+                    (parent == "2." + DESKTOP_ID and values.get("Type", "").startswith("background tasks"))):
+                continue
+            words = set(re.findall(r"[a-z]+", values.get("Disposition", "").lower()))
+            statuses = words & {"allowed", "disallowed"}
+            if len(statuses) != 1:
+                raise ValueError("Claude 后台任务缺少唯一明确的允许/禁止状态")
+            permissions.update(statuses)
+    if not matched_user:
+        raise ValueError("BTM 数据中没有当前用户，无法确认权限")
+    if len(permissions) > 1:
+        raise ValueError("Claude 后台任务权限记录相互冲突")
+    return next(iter(permissions)) if permissions else "not_registered"
 
 
 def is_claude_service(label: str) -> bool:
@@ -327,9 +365,21 @@ def is_claude_service(label: str) -> bool:
 
 
 def read_background_state() -> BackgroundState:
-    # dumpbtm 即便只读也会请求 system.privilege.admin，可能弹出密码窗口。
-    # 不查询 BTM、不提权、不使用缓存冒充当前权限；只读取当前用户的服务状态。
+    # 仅显式配置一次性只读授权后查询；sudo -n 失败时绝不回退到交互式授权。
+    # 不直接执行普通用户身份的 dumpbtm（它会自行请求管理员授权）。
     state = BackgroundState()
+    rule = background_rule_path()
+    if rule.exists() or rule.is_symlink():
+        state.permission = "unknown"
+        try:
+            result = subprocess.run(
+                ["/usr/bin/sudo", "-n", "--", "/usr/bin/sfltool", "dumpbtm"],
+                capture_output=True, text=True, check=True, timeout=5, stdin=subprocess.DEVNULL,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            state.permission = parse_background_permission(result.stdout, os.getuid())
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            state.errors.append(f"后台权限未核验（只读授权不可用或查询失败，未请求密码）: {type(exc).__name__}")
     try:
         result = subprocess.run(["/bin/launchctl", "list"], capture_output=True, text=True,
                                 check=True, timeout=5, stdin=subprocess.DEVNULL)
@@ -356,8 +406,14 @@ def read_background_state() -> BackgroundState:
 
 
 def report_background(state: BackgroundState) -> None:
-    print("[INFO] 后台权限: 未读取（免密码模式）；可在「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中查看或关闭 Claude。",
-          flush=True)
+    labels = {
+        "not_configured": "[INFO] 后台权限: 未读取（免密码模式）；可一次性启用只读授权，或在「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中查看或关闭 Claude。",
+        "disallowed": "[OK] 后台任务权限: 已关闭",
+        "allowed": "⚠️⚠️⚠️ Claude 的后台权限处于开启状态，建议从「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中关闭 Claude。",
+        "not_registered": "[INFO] 后台任务权限: 未登记持续后台任务",
+        "unknown": "[WARN] 后台任务权限: 未确认",
+    }
+    print(labels[state.permission], flush=True)
     for pid, labels_for_pid in sorted(state.jobs.items()):
         print(f"后台服务仍报告 PID {pid}: {', '.join(labels_for_pid)}", file=sys.stderr)
     for error in state.errors:
@@ -463,7 +519,7 @@ def main(arguments: Optional[List[str]] = None) -> int:
         return 2
     kind, forwarded = arguments[0], arguments[1:]
     if kind != "check" and forwarded in (["-h"], ["--help"]):
-        print("ccguard-kill [--dry-run]：正常退出、清理残留，连续观察后核验后台服务；不读取或更改后台权限，无需管理员密码。"
+        print("ccguard-kill [--dry-run]：正常退出、清理残留，连续观察后核验后台服务；可选一次性授权读取后台权限，不询问密码、不更改开关。"
               "返回码 0=范围内未检出，1=有残留/失败，2=后台或归属未确认。" if kind == "kill" else
               f"ccguard-{kind} [参数…]：先运行 net_check.py，再询问 [y/N]；参数原样传给 Claude。")
         return 0

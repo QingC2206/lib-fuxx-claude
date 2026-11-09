@@ -21,7 +21,7 @@ PATH_BEGIN = "# >>> personal-ccguard PATH >>>"
 PATH_END = "# <<< personal-ccguard PATH <<<"
 COMMANDS = {"ccguard-check": "check", "ccguard-cli": "cli",
             "ccguard-desktop": "desktop", "ccguard-kill": "kill"}
-PAYLOAD = ("ccguard.py", "net_check.py", "install.py", "VERSION")
+PAYLOAD = ("ccguard.py", "net_check.py", "install.py", "VERSION", "background-access.sh")
 LEGACY_APP_ID = "personal-claude-tools"
 LEGACY_COMMANDS = {"fuck-claude-check": "check", "fuck-claude-cli": "cli",
                    "fuck-claude-desktop": "desktop", "kill-claude": "kill"}
@@ -241,6 +241,10 @@ def install(package: Path, prefix: Path, python: Path, profile: Optional[Path]) 
     return [str(prefix / "bin" / name) for name in COMMANDS]
 
 
+def background_rule_path() -> Path:
+    return Path(f"/private/etc/sudoers.d/ccguard-btm-{os.getuid()}")
+
+
 def uninstall(prefix: Path) -> List[str]:
     app_dir = prefix / "lib/ccguard"
     if app_dir.is_symlink():
@@ -249,6 +253,10 @@ def uninstall(prefix: Path) -> List[str]:
     manifest = read_manifest(manifest_path)
     if manifest is None:
         return []
+    rule = background_rule_path()
+    if rule.exists() or rule.is_symlink():
+        command = "bash " + shlex.quote(str(app_dir / "background-access.sh")) + " disable"
+        raise ValueError(f"请先撤销本用户的后台只读授权，再卸载: {command}")
     preserved = []
     # 固定白名单，安装记录中的路径不能导致删除安装目录外的文件。
     allowed = {"lib/ccguard/" + name for name in PAYLOAD} | {"bin/" + name for name in COMMANDS}

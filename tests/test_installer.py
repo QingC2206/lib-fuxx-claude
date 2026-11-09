@@ -25,6 +25,10 @@ class InstallerTests(unittest.TestCase):
         self.prefix = self.root / ".local"
         self.profile = self.root / ".zshrc"
         self.python = Path(sys.executable).resolve()
+        self.background_rule = self.root / "sudoers-fixture/ccguard-btm-501"
+        patcher = patch.object(installer, "background_rule_path", return_value=self.background_rule)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # Installing files must never run a subprocess, exec or kill any process.
         for name in ("run", "Popen"):
             blocker = patch.object(subprocess, name, side_effect=AssertionError("external execution forbidden"))
@@ -58,6 +62,30 @@ class InstallerTests(unittest.TestCase):
         self.install()
         self.assertEqual(before, {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()})
         self.assertEqual(self.profile.read_text().count(installer.PATH_BEGIN), 1)
+
+    def test_existing_install_gains_optional_setup_file_without_authorization(self):
+        self.install()
+        root = self.prefix / "lib/ccguard"
+        manifest_path = root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["files"]["lib/ccguard/background-access.sh"]
+        manifest["version"] = "2026.11.08.1"
+        manifest_path.write_text(json.dumps(manifest))
+        (root / "background-access.sh").unlink()
+        self.install()
+        self.assertEqual((root / "background-access.sh").read_bytes(), (PACKAGE / "background-access.sh").read_bytes())
+        self.assertFalse(self.background_rule.exists())
+
+    def test_uninstall_requires_revoke_before_removing_setup_tool(self):
+        self.install()
+        self.background_rule.parent.mkdir()
+        self.background_rule.write_text("rule fixture")
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        with self.assertRaisesRegex(ValueError, '先撤销.*disable'):
+            installer.uninstall(self.prefix)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+        self.background_rule.unlink()
+        self.assertEqual(installer.uninstall(self.prefix), [])
 
     def test_existing_shell_config_is_exactly_restored(self):
         for original in (b'export EXISTING=value\n', b'export EXISTING=value'):

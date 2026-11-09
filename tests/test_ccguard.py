@@ -32,6 +32,7 @@ class OfflineCase(unittest.TestCase):
             blocker.start()
             self.addCleanup(blocker.stop)
         for owner, name, value in ((commands.os, "getuid", UID), (commands.os, "getpid", 9000),
+                                   (commands, "background_rule_path", Path("/fixture/no-background-rule")),
                                    (commands, "responsible_process_id", None)):
             blocker = patch.object(owner, name, return_value=value)
             blocker.start()
@@ -428,6 +429,99 @@ class ProcessTests(OfflineCase):
             commands.snapshot_processes()
 
 
+class BackgroundPermissionTests(OfflineCase):
+    HEADER = " Records for UID 501 : 00000000-0000-0000-0000-000000000000\n"
+    RECORD = """ #12:
+                 Name: Claude - background tasks
+                 Type: background tasks (0x2000)
+          Disposition: [enabled, disallowed, notified] (0x9)
+           Identifier: 8192.com.anthropic.claudefordesktop
+    Parent Identifier: 2.com.anthropic.claudefordesktop
+"""
+
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.rule = Path(temporary.name) / "ccguard-btm-501"
+        self.rule.write_text("fixture rule; never interpreted by sudo")
+        for name, value in (("background_rule_path", self.rule), ("responsibility_function", Mock())):
+            patcher = patch.object(commands, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_permission_uses_allowed_not_enabled(self):
+        for status in ("allowed", "disallowed"):
+            with self.subTest(status=status):
+                self.assertEqual(commands.parse_background_permission(
+                    self.HEADER + self.RECORD.replace("disallowed", status), UID), status)
+
+    def test_other_users_and_summary_records_do_not_override_current_user(self):
+        other = self.RECORD.replace("disallowed", "allowed")
+        text = (self.HEADER.replace("501", "-2") + other + self.HEADER.replace("501", "0") + other
+                + self.HEADER + self.RECORD + self.HEADER.replace("501", "502") + other)
+        self.assertEqual(commands.parse_background_permission(text, UID), "disallowed")
+
+    def test_app_record_is_not_background_permission(self):
+        app = " #11:\n Type: app (0x2)\n Disposition: [enabled, allowed]\n Identifier: 2." + commands.DESKTOP_ID + "\n"
+        self.assertEqual(commands.parse_background_permission(self.HEADER + app, UID), "not_registered")
+        self.assertEqual(commands.parse_background_permission(self.HEADER + app + self.RECORD, UID), "disallowed")
+
+    def test_conflicts_missing_user_and_unknown_format_remain_unknown(self):
+        for output in ("unknown output", self.HEADER.replace("501", "0") + self.RECORD,
+                       self.HEADER + self.RECORD.replace("disallowed", "unknown"),
+                       self.HEADER + self.RECORD.replace("disallowed", "allowed, disallowed"),
+                       self.HEADER + self.RECORD + self.RECORD.replace("#12", "#13").replace("disallowed", "allowed")):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                commands.parse_background_permission(output, UID)
+
+    def test_authorized_query_is_fixed_readonly_command_and_never_interactive(self):
+        with patch.object(commands.subprocess, "run", side_effect=[
+                Mock(stdout=self.HEADER + self.RECORD), Mock(stdout="PID Status Label\n")]) as run:
+            state = commands.read_background_state()
+        self.assertEqual(state.permission, "disallowed")
+        self.assertEqual(state.errors, [])
+        first = run.call_args_list[0]
+        self.assertEqual(first.args[0], ["/usr/bin/sudo", "-n", "--", "/usr/bin/sfltool", "dumpbtm"])
+        self.assertEqual(first.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(first.kwargs["env"]["LC_ALL"], "C")
+        self.assertTrue(first.kwargs["check"])
+        self.assertEqual(first.kwargs["timeout"], 5)
+        self.assertEqual(run.call_count, 2)
+
+    def test_denial_timeout_and_invalid_data_never_retry_with_password(self):
+        for result in (PermissionError("denied"), subprocess.CalledProcessError(1, "sudo"),
+                       subprocess.TimeoutExpired("sudo", 5), Mock(stdout="invalid format")):
+            with self.subTest(result=result), \
+                 patch.object(commands.subprocess, "run", side_effect=[result, Mock(stdout="PID Status Label\n")]) as run, \
+                 patch("builtins.input", side_effect=AssertionError("must not request password")):
+                state = commands.read_background_state()
+            self.assertEqual(state.permission, "unknown")
+            self.assertEqual(len(state.errors), 1)
+            self.assertIn("未请求密码", state.errors[0])
+            self.assertEqual([c.args[0] for c in run.call_args_list], [
+                ["/usr/bin/sudo", "-n", "--", "/usr/bin/sfltool", "dumpbtm"], ["/bin/launchctl", "list"]])
+
+    def test_every_query_reads_fresh_permission_and_revocation_stops_querying(self):
+        with patch.object(commands.subprocess, "run", side_effect=[
+                Mock(stdout=self.HEADER + self.RECORD), Mock(stdout="PID Status Label\n"),
+                Mock(stdout=self.HEADER + self.RECORD.replace("disallowed", "allowed")),
+                Mock(stdout="PID Status Label\n"), Mock(stdout="PID Status Label\n")]) as run:
+            self.assertEqual(commands.read_background_state().permission, "disallowed")
+            self.assertEqual(commands.read_background_state().permission, "allowed")
+            self.rule.unlink()
+            self.assertEqual(commands.read_background_state().permission, "not_configured")
+        self.assertEqual(sum(c.args[0][0] == "/usr/bin/sudo" for c in run.call_args_list), 2)
+
+    def test_permission_display_does_not_prompt_or_change_settings(self):
+        for status, expected in (("allowed", "⚠️⚠️⚠️"), ("disallowed", "[OK] 后台任务权限: 已关闭"),
+                                 ("not_registered", "未登记持续后台任务"), ("unknown", "[WARN]")):
+            with self.subTest(status=status), contextlib.redirect_stdout(io.StringIO()) as output, \
+                 patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                commands.report_background(commands.BackgroundState(permission=status))
+                self.assertIn(expected, output.getvalue())
+
+
 class BackgroundTests(OfflineCase):
     def setUp(self):
         super().setUp()
@@ -657,6 +751,29 @@ class QuitTests(OfflineCase):
             self.assertEqual(commands.kill_claude(), 0)
         self.assertIn("后台权限: 未读取（免密码模式）", self.stdout.getvalue())
         self.assertIn("系统设置 → 通用 → 登录项与扩展 → App 后台活动", self.stdout.getvalue())
+
+    def test_known_permission_is_advisory_when_no_process_or_service_remains(self):
+        for permission in ("allowed", "disallowed", "not_registered"):
+            with self.subTest(permission=permission), \
+                 patch.object(commands, "snapshot_processes", return_value={}), \
+                 patch.object(commands, "wait_for_exit", return_value={}), \
+                 patch.object(commands, "read_background_state",
+                              return_value=commands.BackgroundState(permission=permission)), \
+                 patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                self.assertEqual(commands.kill_claude(), 0)
+
+    def test_failed_authorized_query_reports_unknown_for_normal_and_dry_run(self):
+        state = commands.BackgroundState(permission="unknown", errors=["后台权限未核验，未请求密码"])
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), \
+                 patch.object(commands, "snapshot_processes", return_value={}), \
+                 patch.object(commands, "wait_for_exit", return_value={}), \
+                 patch.object(commands, "read_background_state", return_value=state), \
+                 patch("builtins.input", side_effect=AssertionError("must not prompt")), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(commands.kill_claude(dry_run=dry_run), 2)
+                self.assertIn("[WARN] 后台任务权限: 未确认", output.getvalue())
+                self.assertNotIn("已关闭", output.getvalue())
 
     def test_normal_and_dry_run_paths_only_use_unprivileged_quit_and_service_commands(self):
         desktop = process(10, executable=str(APP / "Contents/MacOS/Claude"))
