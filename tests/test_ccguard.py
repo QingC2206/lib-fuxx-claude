@@ -750,7 +750,7 @@ class QuitTests(OfflineCase):
              patch("builtins.input", side_effect=AssertionError("background warning must not prompt")):
             self.assertEqual(commands.kill_claude(), 0)
         self.assertIn("后台权限: 未读取（免密码模式）", self.stdout.getvalue())
-        self.assertIn("系统设置 → 通用 → 登录项与扩展 → App 后台活动", self.stdout.getvalue())
+        self.assertIn("\nbash ~/.local/lib/ccguard/background-access.sh enable\n", self.stdout.getvalue())
 
     def test_known_permission_is_advisory_when_no_process_or_service_remains(self):
         for permission in ("allowed", "disallowed", "not_registered"):

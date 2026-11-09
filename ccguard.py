@@ -407,7 +407,8 @@ def read_background_state() -> BackgroundState:
 
 def report_background(state: BackgroundState) -> None:
     labels = {
-        "not_configured": "[INFO] 后台权限: 未读取（免密码模式）；可一次性启用只读授权，或在「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中查看或关闭 Claude。",
+        "not_configured": "[INFO] 后台权限: 未读取（免密码模式）。如需一次性授权，请执行：\n"
+                          "bash ~/.local/lib/ccguard/background-access.sh enable",
         "disallowed": "[OK] 后台任务权限: 已关闭",
         "allowed": "⚠️⚠️⚠️ Claude 的后台权限处于开启状态，建议从「系统设置 → 通用 → 登录项与扩展 → App 后台活动」中关闭 Claude。",
         "not_registered": "[INFO] 后台任务权限: 未登记持续后台任务",
